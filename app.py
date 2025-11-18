@@ -198,7 +198,14 @@ def build_distance_time_matrices(relief_centres, disaster_sites):
 # ---------------------------------------------------------------------
 def run_moo_algorithms(relief_centres, disaster_sites, mode='Full'):
     """
-    Runs NSGA-II, MOEA/D and SPEA2.
+    Runs NSGA-II, MOEA/D and SPEA2 using a proportional/allocation MOO formulation.
+    - Constraints:
+        * For each disaster site:  total_allocated_to_site <= demand_site
+        * For each relief centre: total_allocated_from_rc <= supply_rc
+    - Objectives:
+        f1 = total_time + alpha_unused * total_unused_supply
+        f2 = total_distance + alpha_unused * total_unused_supply
+        f3 = -priority_fulfillment + alpha_unused * total_unused_supply
     - mode: 'Full' (default) or 'Quick' (smaller pop/gens)
     """
     try:
@@ -234,70 +241,106 @@ def run_moo_algorithms(relief_centres, disaster_sites, mode='Full'):
     for ds in disaster_sites:
         ds["priority_score"] = (ds.get("people_affected", 1) * ds.get("severity_level", 1)) / normalization
 
+    # demand and supply vectors
+    demand_vector = np.array([ds.get("demand", 0) for ds in disaster_sites], dtype=float)
+    supply_vector = np.array([rc.get("supply", 0) for rc in relief_centres], dtype=float)
+
     # distance/time matrices
     distance_matrix, time_matrix = build_distance_time_matrices(relief_centres, disaster_sites)
 
-    # pre-check: if we enforce 1 unit per DS, ensure total supply >= number of sites
-    total_supply = sum(rc.get("supply", 0) for rc in relief_centres)
+    # pre-check: warn if total supply < number of sites (still allowed)
+    total_supply = float(np.sum(supply_vector))
     total_min_required = len(disaster_sites)
-    if total_supply < total_min_required:
-        st.warning(f"Total available supply ({total_supply}) is less than number of disaster sites ({total_min_required}). "
-                   "Constrained algorithms may be infeasible. Consider increasing supply or switching to Quick mode.")
+    if total_supply < 1:
+        st.warning(f"Total available supply ({total_supply}) is extremely low — results may be degenerate.")
 
-    # Constrained problem (G: 1 - sum_alloc_ds <= 0)
+    # penalty weight for unused supply (user chose medium)
+    ALPHA_UNUSED = 1.0
+
+    # Helper sizes
+    n_rc = len(relief_centres)
+    n_ds = len(disaster_sites)
+    n_var = n_rc * n_ds
+
+    # upper bounds per variable: cannot allocate more than rc supply or ds demand
+    xu = np.array([min(supply_vector[rc_idx], demand_vector[ds_idx])
+                   for rc_idx in range(n_rc) for ds_idx in range(n_ds)], dtype=float)
+    xl = np.zeros(n_var, dtype=float)
+
+    # -------------------------------
+    # Constrained problem (NSGA-II / SPEA2)
+    # Constraints G: first n_ds entries -> sum_alloc_to_ds - demand_ds <= 0
+    #                next n_rc entries  -> sum_alloc_from_rc - supply_rc <= 0
+    # -------------------------------
     class ResourceAllocationProblem(Problem):
         def __init__(self, relief_centers, disaster_sites, distance_matrix, time_matrix):
             self.relief_centers = relief_centers
             self.disaster_sites = disaster_sites
             self.distance_matrix = distance_matrix
             self.time_matrix = time_matrix
-            n_var = len(relief_centers) * len(disaster_sites)
-            xl = np.zeros(n_var)
-            xu = np.array([min(rc.get("supply", 1000), ds.get("demand", 1000)) for rc in relief_centers for ds in disaster_sites])
-            n_obj = 3
-            n_constr = len(disaster_sites)
-            # Call Problem constructor with constraints
-            Problem.__init__(self, n_var=n_var, n_obj=n_obj, n_constr=n_constr, xl=xl, xu=xu)
+            n_var_local = len(relief_centers) * len(disaster_sites)
+            xl_local = np.zeros(n_var_local)
+            xu_local = np.array([min(rc.get("supply", 1000), ds.get("demand", 1000)) for rc in relief_centers for ds in disaster_sites])
+            n_obj_local = 3
+            # constraints: n_ds (demand upper bound) + n_rc (supply upper bound)
+            n_constr_local = len(disaster_sites) + len(relief_centers)
+            Problem.__init__(self, n_var=n_var_local, n_obj=n_obj_local, n_constr=n_constr_local, xl=xl_local, xu=xu_local)
 
         def _evaluate(self, x, out, *args, **kwargs):
             n_solutions = x.shape[0]
             f1 = np.zeros(n_solutions)
             f2 = np.zeros(n_solutions)
             f3 = np.zeros(n_solutions)
-            G = np.zeros((n_solutions, len(self.disaster_sites)))
+            G = np.zeros((n_solutions, len(self.disaster_sites) + len(self.relief_centers)))
             for i in range(n_solutions):
-                allocation = np.rint(x[i].reshape(len(self.relief_centers), len(self.disaster_sites))).astype(int)
+                # round to integers for allocation interpretation
+                alloc = np.rint(x[i].reshape(len(self.relief_centers), len(self.disaster_sites))).astype(int)
                 total_time = 0.0
                 total_distance = 0.0
                 priority_fulfillment = 0.0
-                sum_per_ds = allocation.sum(axis=0)
-                for rc_idx, rc in enumerate(self.relief_centers):
-                    for ds_idx, ds in enumerate(self.disaster_sites):
-                        allocated = allocation[rc_idx, ds_idx]
+
+                # per-DS and per-RC sums
+                sum_per_ds = alloc.sum(axis=0)   # length n_ds
+                sum_per_rc = alloc.sum(axis=1)   # length n_rc
+
+                # compute objectives (time/distance/priority)
+                for rc_idx in range(len(self.relief_centers)):
+                    for ds_idx in range(len(self.disaster_sites)):
+                        allocated = alloc[rc_idx, ds_idx]
                         if allocated > 0:
                             total_time += self.time_matrix[rc_idx][ds_idx] * allocated
                             total_distance += self.distance_matrix[rc_idx][ds_idx] * allocated
-                            priority_fulfillment += allocated * ds.get("priority_score", 0)
-                f1[i] = total_time
-                f2[i] = total_distance
-                f3[i] = -priority_fulfillment
-                G[i, :] = 1.0 - sum_per_ds
+                            priority_fulfillment += allocated * self.disaster_sites[ds_idx].get("priority_score", 0)
+
+                # unused supply penalty
+                unused_supply = float(np.sum(np.maximum(supply_vector - sum_per_rc, 0.0)))
+                penalty = ALPHA_UNUSED * unused_supply
+
+                f1[i] = total_time + penalty
+                f2[i] = total_distance + penalty
+                f3[i] = -priority_fulfillment + penalty
+
+                # Constraints: sum_per_ds <= demand_vector  -> sum_per_ds - demand <= 0
+                G[i, 0:len(self.disaster_sites)] = sum_per_ds - demand_vector
+                # Constraints: sum_per_rc <= supply_vector -> sum_per_rc - supply <= 0
+                G[i, len(self.disaster_sites):] = sum_per_rc - supply_vector
+
             out["F"] = np.column_stack([f1, f2, f3])
             out["G"] = G
 
-    # Unconstrained problem (same objectives but no G) for MOEA/D
-    # IMPORTANT: call Problem.__init__ directly with n_constr=0 (read-only property can't be set later)
+    # -------------------------------
+    # Unconstrained problem for MOEA/D (we'll add soft unused-supply penalty inside objectives)
+    # -------------------------------
     class UnconstrainedProblem(Problem):
         def __init__(self, relief_centers, disaster_sites, distance_matrix, time_matrix):
             self.relief_centers = relief_centers
             self.disaster_sites = disaster_sites
             self.distance_matrix = distance_matrix
             self.time_matrix = time_matrix
-            n_var = len(relief_centers) * len(disaster_sites)
-            xl = np.zeros(n_var)
-            xu = np.array([min(rc.get("supply", 1000), ds.get("demand", 1000)) for rc in relief_centers for ds in disaster_sites])
-            # Call Problem.__init__ directly with zero constraints
-            Problem.__init__(self, n_var=n_var, n_obj=3, n_constr=0, xl=xl, xu=xu)
+            n_var_local = len(relief_centers) * len(disaster_sites)
+            xl_local = np.zeros(n_var_local)
+            xu_local = np.array([min(rc.get("supply", 1000), ds.get("demand", 1000)) for rc in relief_centers for ds in disaster_sites])
+            Problem.__init__(self, n_var=n_var_local, n_obj=3, n_constr=0, xl=xl_local, xu=xu_local)
 
         def _evaluate(self, x, out, *args, **kwargs):
             n_solutions = x.shape[0]
@@ -305,20 +348,33 @@ def run_moo_algorithms(relief_centres, disaster_sites, mode='Full'):
             f2 = np.zeros(n_solutions)
             f3 = np.zeros(n_solutions)
             for i in range(n_solutions):
-                allocation = np.rint(x[i].reshape(len(self.relief_centers), len(self.disaster_sites))).astype(int)
+                alloc = np.rint(x[i].reshape(len(self.relief_centers), len(self.disaster_sites))).astype(int)
                 total_time = 0.0
                 total_distance = 0.0
                 priority_fulfillment = 0.0
-                for rc_idx, rc in enumerate(self.relief_centers):
-                    for ds_idx, ds in enumerate(self.disaster_sites):
-                        allocated = allocation[rc_idx, ds_idx]
+                sum_per_ds = alloc.sum(axis=0)
+                sum_per_rc = alloc.sum(axis=1)
+
+                for rc_idx in range(len(self.relief_centers)):
+                    for ds_idx in range(len(self.disaster_sites)):
+                        allocated = alloc[rc_idx, ds_idx]
                         if allocated > 0:
                             total_time += self.time_matrix[rc_idx][ds_idx] * allocated
                             total_distance += self.distance_matrix[rc_idx][ds_idx] * allocated
-                            priority_fulfillment += allocated * ds.get("priority_score", 0)
-                f1[i] = total_time
-                f2[i] = total_distance
-                f3[i] = -priority_fulfillment
+                            priority_fulfillment += allocated * self.disaster_sites[ds_idx].get("priority_score", 0)
+
+                # penalize allocations that exceed demand or supply (softly), and penalize unused supply
+                exceed_demand = float(np.sum(np.maximum(sum_per_ds - demand_vector, 0.0)))
+                exceed_supply = float(np.sum(np.maximum(sum_per_rc - supply_vector, 0.0)))
+                unused_supply = float(np.sum(np.maximum(supply_vector - sum_per_rc, 0.0)))
+
+                soft_penalty = 1e6 * (exceed_demand + exceed_supply)  # large penalty for hard violations
+                leftover_penalty = ALPHA_UNUSED * unused_supply
+
+                f1[i] = total_time + leftover_penalty + soft_penalty
+                f2[i] = total_distance + leftover_penalty + soft_penalty
+                f3[i] = -priority_fulfillment + leftover_penalty + soft_penalty
+
             out["F"] = np.column_stack([f1, f2, f3])
 
     problem_constrained = ResourceAllocationProblem(relief_centres, disaster_sites, distance_matrix, time_matrix)
@@ -334,10 +390,26 @@ def run_moo_algorithms(relief_centres, disaster_sites, mode='Full'):
         F = res.F if hasattr(res, "F") else np.zeros((0, 3))
         X = res.X if hasattr(res, "X") else np.zeros((0, problem.n_var))
         pareto_size = len(F)
-        min_time_idx = int(np.argmin(F[:, 0])) if F.shape[0] > 0 else None
-        min_time_solution = F[min_time_idx] if min_time_idx is not None else None
+
+        # Safe selection: ignore trivial all-zero solutions and any that violate hard bounds (for unconstrained)
+        min_time_idx = None
+        min_time_solution = None
+        if F.shape[0] > 0:
+            # mask out trivial solutions (all objectives nearly zero)
+            non_trivial_mask = ~np.all(np.isclose(F, 0.0, atol=1e-6), axis=1)
+            if np.any(non_trivial_mask):
+                valid_idxs = np.where(non_trivial_mask)[0]
+                # among valid, choose min time
+                rel_idx = int(np.argmin(F[valid_idxs, 0]))
+                min_time_idx = int(valid_idxs[rel_idx])
+                min_time_solution = F[min_time_idx]
+            else:
+                # if all trivial, keep None
+                min_time_idx = None
+                min_time_solution = None
+
         allocation = None
-        if min_time_idx is not None:
+        if min_time_idx is not None and X.shape[0] > 0:
             allocation = {}
             vec = X[min_time_idx]
             alloc_mat = np.rint(vec.reshape(len(relief_centres), len(disaster_sites))).astype(int)
@@ -347,6 +419,7 @@ def run_moo_algorithms(relief_centres, disaster_sites, mode='Full'):
                     if allocated > 0:
                         allocation[(rc.get("id", rc.get("name", f"RC{rc_idx}")),
                                     ds.get("id", ds.get("name", f"DS{ds_idx}")))] = allocated
+
         return {
             'res_obj': res,
             'exec_time': exec_time,
@@ -371,8 +444,9 @@ def run_moo_algorithms(relief_centres, disaster_sites, mode='Full'):
     nsga_res = _run_algorithm_on_problem(nsga_algo, problem_constrained, "NSGA-II", ('n_gen', nsga_gen))
     results['NSGA-II'] = nsga_res
 
-    # MOEA/D (unconstrained)
+    # MOEA/D (unconstrained but with penalties)
     st.info("Running MOEA/D (unconstrained)")
+    # choose reference directions (tune partitions if needed)
     ref_dirs = get_reference_directions("das-dennis", n_dim=3, n_partitions=12)
     moead_algo = MOEAD(
         ref_dirs=ref_dirs,
@@ -397,7 +471,7 @@ def run_moo_algorithms(relief_centres, disaster_sites, mode='Full'):
     spea2_res = _run_algorithm_on_problem(spea2_algo, problem_constrained, "SPEA2", ('n_gen', spea_gen))
     results['SPEA2'] = spea2_res
 
-    # Build performance DataFrame
+    # Build performance DataFrame (safe min fetch)
     def _safe_min_time(sol):
         return sol[0] if sol is not None else float('inf')
 
@@ -422,7 +496,7 @@ def run_moo_algorithms(relief_centres, disaster_sites, mode='Full'):
         ]
     })
 
-    # pick best
+    # pick best (same heuristic as before)
     best_time_algo = perf.loc[perf['Min Delivery Time'].idxmin()]['Algorithm']
     best_time_value = perf['Min Delivery Time'].min()
     best_priority_algo = perf.loc[perf['Priority for Min Time'].idxmax()]['Algorithm']
@@ -453,6 +527,7 @@ def run_moo_algorithms(relief_centres, disaster_sites, mode='Full'):
         'scores': scores
     }
     return out
+
 
 # ---------------------------------------------------------------------
 # Summarize allocation to per-site (Option A: pick RC with max units)
@@ -602,7 +677,7 @@ def add_relief_centre(lat, lon, supply=1000):
         "name": f"Manual RC {rc_id+1}",
         "lat": lat,
         "lon": lon,
-        "supply": supply,
+        "supply": None,
         "area": "User Added",
         "source": "Manual"
     }
@@ -675,6 +750,18 @@ def render_sidebar():
         st.sidebar.markdown("### 🔄 PSO Running...")
         st.sidebar.info("PSO proposes relief centre locations. After completion you can edit them.")
     elif current == 'editing':
+        st.markdown("### 📦 Enter Supply for Each Relief Centre")
+
+        for rc in st.session_state.relief_centres:
+            default_supply = rc.get("supply") or 0
+            rc["supply"] = st.number_input(
+                f"Supply for {rc['name']} ({rc['area']})",
+                min_value=0,
+                max_value=10000,
+                value=default_supply,
+                key=f"supply_{rc['id']}"
+            )
+
         st.sidebar.markdown("### ✏️ Review Relief Centres")
         satisfied = st.sidebar.radio("Are you satisfied with the relief centres?", options=["Select...", "Yes", "No"], key="satisfaction_radio")
         if satisfied == "Yes":

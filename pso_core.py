@@ -4,6 +4,8 @@
 import math
 from itertools import combinations
 
+
+
 # -------------------------------
 # Disaster Sites (copied as-is)
 # -------------------------------
@@ -44,31 +46,38 @@ def fitness_function(particle_position, disaster_sites,
                      weight_spread=1.0,
                      weight_coverage=2.0):
     """
-    Composite fitness function:
+    Composite fitness function with:
     1. Weighted distance to disaster sites
-    2. Penalty for RC <1.5 km to a disaster site
-    3. Encourage spread between RCs
-    4. Coverage of disaster sites (<5 km)
-    5. Penalty for RC >8 km from all sites
+    2. Penalty if RC < 1.5 km from a site
+    3. Incentive for high spread between RCs
+    4. Coverage bonus (site within 5 km)
+    5. Penalty if RC is >8 km away from ALL sites
     """
 
+    # Convert flat particle list -> list of (lat, lon)
     relief_centers = [
         (particle_position[i], particle_position[i + 1])
         for i in range(0, len(particle_position), 2)
     ]
 
-    # Objective 1 — Weighted distance
+    # -------------------------------
+    # 1. Weighted distance objective
+    # -------------------------------
     weighted_distance = 0
     for site in disaster_sites:
         site_coord = (site["lat"], site["lon"])
         priority = site["priority"]
+
         distances = [
             haversine_km(site_coord[0], site_coord[1], rc[0], rc[1])
             for rc in relief_centers
         ]
+
         weighted_distance += min(distances) * (11 - priority)
 
-    # Objective 2 — Too close penalty
+    # -------------------------------
+    # 2. Proximity penalty (<1.5 km)
+    # -------------------------------
     penalty_proximity = 0
     for rc in relief_centers:
         for site in disaster_sites:
@@ -76,22 +85,36 @@ def fitness_function(particle_position, disaster_sites,
             if d < 1.5:
                 penalty_proximity += (1.5 - d)
 
-    # Objective 3 — Spread
-    inter = [
-        haversine_km(a[0], a[1], b[0], b[1])
-        for a, b in combinations(relief_centers, 2)
-    ]
-    avg_inter = sum(inter) / len(inter)
+    # -------------------------------
+    # 3. Spread between RCs
+    # -------------------------------
+    inter = []
+    for (i, j) in combinations(relief_centers, 2):
+        d = haversine_km(i[0], i[1], j[0], j[1])
+        inter.append(d)
+
+    if len(inter) == 0:
+        avg_inter = 0
+    else:
+        avg_inter = sum(inter) / len(inter)
+
+    # Spread penalty: higher spread = better = negative score
     spread_penalty = -avg_inter
 
-    # Objective 4 — Coverage: site within 5 km?
+    # -------------------------------
+    # 4. Coverage bonus (<5 km)
+    # -------------------------------
     covered_sites = 0
     for site in disaster_sites:
-        if any(haversine_km(site["lat"], site["lon"], rc[0], rc[1]) <= 5.0 for rc in relief_centers):
+        if any(haversine_km(site["lat"], site["lon"], rc[0], rc[1]) <= 5.0
+               for rc in relief_centers):
             covered_sites += 1
+
     coverage_bonus = -covered_sites
 
-    # Objective 5 — Too far penalty (>8 km)
+    # -------------------------------
+    # 5. Too far (>8 km) penalty
+    # -------------------------------
     too_far_penalty = 0
     for rc in relief_centers:
         d = min(
@@ -101,6 +124,9 @@ def fitness_function(particle_position, disaster_sites,
         if d > 8.0:
             too_far_penalty += (d - 8.0) ** 2
 
+    # -------------------------------
+    # Final fitness score
+    # -------------------------------
     return (
         weight_distance * weighted_distance +
         weight_proximity * penalty_proximity +

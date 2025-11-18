@@ -1,0 +1,7 @@
+streamlit
+folium
+streamlit-folium
+numpy
+pandas
+pymoo==0.6.0
+plotly

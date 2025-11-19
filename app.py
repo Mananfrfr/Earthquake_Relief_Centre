@@ -1,8 +1,9 @@
 # app.py
 """
-Earthquake Relief System - Streamlit app (updated & patched)
-- Requires: streamlit, folium, streamlit_folium, pymoo, plotly, numpy, pandas
-- Uses PSO core at: /mnt/data/pso_core.py
+Earthquake Relief System - Streamlit app (updated)
+- Per-RC supplies entered AFTER marking sites (Option B)
+- PSO uses dynamic bounding box from the marked disaster sites
+- PSO initializes particles inside the dynamic bbox and clamps during updates
 """
 import streamlit as st
 import folium
@@ -12,36 +13,31 @@ import pandas as pd
 import time
 import math
 import random
-import io
 import plotly.express as px
 import plotly.graph_objects as go
 
-# Import PSO fitness & helpers from uploaded module
-from pso_core import fitness_function, disaster_sites as default_disaster_sites, haversine_km
+# Import PSO fitness & helpers
+from pso_core import fitness_function, haversine_km, get_bounds_from_sites
 
 # ---------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------
 DEFAULT_CENTER = [26.9124, 75.7873]
-LAT_MIN, LAT_MAX = 26.80, 27.05
-LON_MIN, LON_MAX = 75.70, 76.00
 
 # PSO hyperparams
 SWARM_SIZE = 30
-MAX_ITER = 50
+MAX_ITER = 60
 W = 0.7
 C1 = 1.5
 C2 = 1.5
 
-# Default MOO hyperparams (full)
+# MOO hyperparams (unchanged)
 DEFAULT_NSGA_POP = 100
 DEFAULT_NSGA_GEN = 100
 DEFAULT_SPEA_POP = 100
 DEFAULT_SPEA_GEN = 100
 DEFAULT_MOEAD_POP = 80
 DEFAULT_MOEAD_GEN = 80
-
-# Quick-mode hyperparams (for fast dev/testing)
 QUICK_NSGA_POP = 40
 QUICK_NSGA_GEN = 40
 QUICK_SPEA_POP = 40
@@ -60,7 +56,7 @@ def init_session_state():
     if 'num_disaster_sites' not in st.session_state:
         st.session_state.num_disaster_sites = 0
     if 'num_relief_centres' not in st.session_state:
-        st.session_state.num_relief_centres = 5
+        st.session_state.num_relief_centres = 3
     if 'current_step' not in st.session_state:
         st.session_state.current_step = 'setup'
     if 'pso_completed' not in st.session_state:
@@ -72,38 +68,70 @@ def init_session_state():
     if 'user_satisfied' not in st.session_state:
         st.session_state.user_satisfied = None
     if 'moo_mode' not in st.session_state:
-        st.session_state.moo_mode = 'Full'  # Full or Quick
+        st.session_state.moo_mode = 'Full'
+    if 'supply_inputs' not in st.session_state:
+        st.session_state.supply_inputs = []
 
 # ---------------------------------------------------------------------
-# PSO Implementation (kept compatible with pso_core fitness)
+# PSO Particle (uses dynamic bbox for initialization & clamping)
 # ---------------------------------------------------------------------
 class Particle:
-    def __init__(self, num_relief_centers):
+    def __init__(self, num_relief_centers, lat_min, lat_max, lon_min, lon_max):
         self.dimensions = num_relief_centers * 2
+        self.lat_min = lat_min
+        self.lat_max = lat_max
+        self.lon_min = lon_min
+        self.lon_max = lon_max
+        # initialize uniformly inside dynamic bbox
         self.position = [
-            random.uniform(LAT_MIN, LAT_MAX) if i % 2 == 0 else random.uniform(LON_MIN, LON_MAX)
+            random.uniform(lat_min, lat_max) if i % 2 == 0 else random.uniform(lon_min, lon_max)
             for i in range(self.dimensions)
         ]
-        self.velocity = [random.uniform(-0.01, 0.01) for _ in range(self.dimensions)]
+        # small random velocity
+        self.velocity = [random.uniform(-0.001, 0.001) for _ in range(self.dimensions)]
         self.best_position = list(self.position)
         self.best_fitness = float('inf')
 
-def run_pso_algorithm(disaster_sites, num_relief_centers=5):
+    def clamp_to_bbox(self):
+        for i in range(self.dimensions):
+            if i % 2 == 0:
+                self.position[i] = max(min(self.position[i], self.lat_max), self.lat_min)
+            else:
+                self.position[i] = max(min(self.position[i], self.lon_max), self.lon_min)
+
+
+def run_pso_algorithm(disaster_sites, num_relief_centers=3, supply_vector=None):
+    """
+    Run PSO with dynamic bounding box derived from disaster_sites.
+    - All particles initialized inside the bounding box of disaster_sites.
+    - During updates we clamp each particle to the bounding box.
+    - fitness_function (in pso_core) also contains a bounding penalty if a particle
+      somehow wanders outside; but clamping will prevent that usually.
+    """
     if not disaster_sites:
         return []
+
+    # compute dynamic bbox from selected sites
+    lat_min, lat_max, lon_min, lon_max = get_bounds_from_sites(disaster_sites)
+    # ensure small area doesn't become zero-size
+    if lat_max - lat_min < 1e-6:
+        lat_min -= 0.001
+        lat_max += 0.001
+    if lon_max - lon_min < 1e-6:
+        lon_min -= 0.001
+        lon_max += 0.001
+
     DIMENSIONS = num_relief_centers * 2
-    swarm = [Particle(num_relief_centers) for _ in range(SWARM_SIZE)]
+    swarm = [Particle(num_relief_centers, lat_min, lat_max, lon_min, lon_max) for _ in range(SWARM_SIZE)]
+
+    # evaluate initial swarm
     global_best_position = None
     global_best_fitness = float('inf')
-
     for particle in swarm:
         fitness = fitness_function(
             particle.position,
             disaster_sites,
-            weight_distance=1.0,
-            weight_proximity=2.0,
-            weight_spread=1.0,
-            weight_coverage=2.0
+            supply_vector
         )
         particle.best_fitness = fitness
         particle.best_position = particle.position[:]
@@ -113,6 +141,7 @@ def run_pso_algorithm(disaster_sites, num_relief_centers=5):
 
     progress_bar = st.progress(0)
     status_text = st.empty()
+
     for iteration in range(MAX_ITER):
         for particle in swarm:
             for i in range(DIMENSIONS):
@@ -122,18 +151,13 @@ def run_pso_algorithm(disaster_sites, num_relief_centers=5):
                 social = C2 * r2 * (global_best_position[i] - particle.position[i])
                 particle.velocity[i] = W * particle.velocity[i] + cognitive + social
                 particle.position[i] += particle.velocity[i]
-                # boundaries
-                if i % 2 == 0:
-                    particle.position[i] = max(min(particle.position[i], LAT_MAX), LAT_MIN)
-                else:
-                    particle.position[i] = max(min(particle.position[i], LON_MAX), LON_MIN)
+            # clamp to dynamic bbox to force search inside user area
+            particle.clamp_to_bbox()
+
             fitness = fitness_function(
                 particle.position,
                 disaster_sites,
-                weight_distance=1.0,
-                weight_proximity=2.0,
-                weight_spread=1.0,
-                weight_coverage=2.0
+                supply_vector
             )
             if fitness < particle.best_fitness:
                 particle.best_fitness = fitness
@@ -141,35 +165,48 @@ def run_pso_algorithm(disaster_sites, num_relief_centers=5):
             if fitness < global_best_fitness:
                 global_best_fitness = fitness
                 global_best_position = particle.position[:]
+
         progress_bar.progress((iteration + 1) / MAX_ITER)
         status_text.text(f"Iteration {iteration+1}/{MAX_ITER} | Best Fitness: {global_best_fitness:.2f}")
+
     progress_bar.empty()
     status_text.empty()
 
+    # create relief centres from best solution
     relief_centres = []
     for i in range(num_relief_centers):
         lat = global_best_position[2 * i]
         lon = global_best_position[2 * i + 1]
-        nearest_site = min(
-            disaster_sites,
-            key=lambda s: haversine_km(lat, lon, s["lat"], s["lon"])
-        )
+        nearest_site = min(disaster_sites, key=lambda s: haversine_km(lat, lon, s["lat"], s["lon"]))
+        supply_value = 0
+        if supply_vector and len(supply_vector) > i:
+            try:
+                supply_value = int(supply_vector[i])
+            except:
+                supply_value = int(float(supply_vector[i]) if supply_vector[i] is not None else 0)
         relief_centres.append({
             "id": f"RC{i}",
             "name": f"Relief Centre {i+1}",
             "lat": lat,
             "lon": lon,
-            "supply": random.randint(500, 2000),
+            "supply": supply_value,
             "area": f"Near {nearest_site.get('name', 'Unknown')}",
             "source": "PSO"
         })
+        # -------------------------------
+        # Print coordinates of all relief centres
+        # -------------------------------
+        st.subheader("📍 Relief Centre Coordinates (PSO Output)")
+        for rc in relief_centres:
+            st.write(f"**{rc['name']}** → Lat: `{rc['lat']}`, Lon: `{rc['lon']}`")
+
     return relief_centres
 
 # ---------------------------------------------------------------------
-# Utilities
+# Utilities - distance/time matrices used by MOO (unchanged)
 # ---------------------------------------------------------------------
 def haversine_distance_time(lat1, lon1, lat2, lon2):
-    R = 6371
+    R = 6371.0
     dlat = math.radians(lat2 - lat1)
     dlon = math.radians(lon2 - lon1)
     a = math.sin(dlat / 2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2)**2
@@ -194,20 +231,17 @@ def build_distance_time_matrices(relief_centres, disaster_sites):
     return distance_matrix, time_matrix
 
 # ---------------------------------------------------------------------
-# MOO: NSGA-II (constrained), SPEA2 (constrained), MOEA/D (unconstrained)
+# The multi-objective allocation functions (unchanged interface)
+# - For brevity they're omitted here in this file listing, but your original
+#   app already contains the MOO implementation. If you want them inside pso_core,
+#   move them over. This file intentionally keeps focus on PSO fitness & helpers.
+# ---------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------
+# MOO functions (unchanged besides using 'supply' fields that are set by PSO or user)
 # ---------------------------------------------------------------------
 def run_moo_algorithms(relief_centres, disaster_sites, mode='Full'):
-    """
-    Runs NSGA-II, MOEA/D and SPEA2 using a proportional/allocation MOO formulation.
-    - Constraints:
-        * For each disaster site:  total_allocated_to_site <= demand_site
-        * For each relief centre: total_allocated_from_rc <= supply_rc
-    - Objectives:
-        f1 = total_time + alpha_unused * total_unused_supply
-        f2 = total_distance + alpha_unused * total_unused_supply
-        f3 = -priority_fulfillment + alpha_unused * total_unused_supply
-    - mode: 'Full' (default) or 'Quick' (smaller pop/gens)
-    """
     try:
         from pymoo.core.problem import Problem
         from pymoo.algorithms.moo.nsga2 import NSGA2
@@ -224,7 +258,6 @@ def run_moo_algorithms(relief_centres, disaster_sites, mode='Full'):
         st.exception(e)
         return None
 
-    # pick hyperparams
     if mode == 'Quick':
         nsga_pop, nsga_gen = QUICK_NSGA_POP, QUICK_NSGA_GEN
         spea_pop, spea_gen = QUICK_SPEA_POP, QUICK_SPEA_GEN
@@ -234,44 +267,31 @@ def run_moo_algorithms(relief_centres, disaster_sites, mode='Full'):
         spea_pop, spea_gen = DEFAULT_SPEA_POP, DEFAULT_SPEA_GEN
         moead_pop, moead_gen = DEFAULT_MOEAD_POP, DEFAULT_MOEAD_GEN
 
-    # build priority scores for disaster sites (used in objective)
     max_people = max((ds.get("people_affected", 1) for ds in disaster_sites), default=1)
     max_sev = max((ds.get("severity_level", 1) for ds in disaster_sites), default=1)
     normalization = max_people * max_sev if max_people * max_sev > 0 else 1
     for ds in disaster_sites:
         ds["priority_score"] = (ds.get("people_affected", 1) * ds.get("severity_level", 1)) / normalization
 
-    # demand and supply vectors
     demand_vector = np.array([ds.get("demand", 0) for ds in disaster_sites], dtype=float)
     supply_vector = np.array([rc.get("supply", 0) for rc in relief_centres], dtype=float)
 
-    # distance/time matrices
     distance_matrix, time_matrix = build_distance_time_matrices(relief_centres, disaster_sites)
 
-    # pre-check: warn if total supply < number of sites (still allowed)
     total_supply = float(np.sum(supply_vector))
-    total_min_required = len(disaster_sites)
     if total_supply < 1:
         st.warning(f"Total available supply ({total_supply}) is extremely low — results may be degenerate.")
 
-    # penalty weight for unused supply (user chose medium)
     ALPHA_UNUSED = 1.0
 
-    # Helper sizes
     n_rc = len(relief_centres)
     n_ds = len(disaster_sites)
     n_var = n_rc * n_ds
 
-    # upper bounds per variable: cannot allocate more than rc supply or ds demand
     xu = np.array([min(supply_vector[rc_idx], demand_vector[ds_idx])
                    for rc_idx in range(n_rc) for ds_idx in range(n_ds)], dtype=float)
     xl = np.zeros(n_var, dtype=float)
 
-    # -------------------------------
-    # Constrained problem (NSGA-II / SPEA2)
-    # Constraints G: first n_ds entries -> sum_alloc_to_ds - demand_ds <= 0
-    #                next n_rc entries  -> sum_alloc_from_rc - supply_rc <= 0
-    # -------------------------------
     class ResourceAllocationProblem(Problem):
         def __init__(self, relief_centers, disaster_sites, distance_matrix, time_matrix):
             self.relief_centers = relief_centers
@@ -282,7 +302,6 @@ def run_moo_algorithms(relief_centres, disaster_sites, mode='Full'):
             xl_local = np.zeros(n_var_local)
             xu_local = np.array([min(rc.get("supply", 1000), ds.get("demand", 1000)) for rc in relief_centers for ds in disaster_sites])
             n_obj_local = 3
-            # constraints: n_ds (demand upper bound) + n_rc (supply upper bound)
             n_constr_local = len(disaster_sites) + len(relief_centers)
             Problem.__init__(self, n_var=n_var_local, n_obj=n_obj_local, n_constr=n_constr_local, xl=xl_local, xu=xu_local)
 
@@ -293,17 +312,14 @@ def run_moo_algorithms(relief_centres, disaster_sites, mode='Full'):
             f3 = np.zeros(n_solutions)
             G = np.zeros((n_solutions, len(self.disaster_sites) + len(self.relief_centers)))
             for i in range(n_solutions):
-                # round to integers for allocation interpretation
                 alloc = np.rint(x[i].reshape(len(self.relief_centers), len(self.disaster_sites))).astype(int)
                 total_time = 0.0
                 total_distance = 0.0
                 priority_fulfillment = 0.0
 
-                # per-DS and per-RC sums
-                sum_per_ds = alloc.sum(axis=0)   # length n_ds
-                sum_per_rc = alloc.sum(axis=1)   # length n_rc
+                sum_per_ds = alloc.sum(axis=0)
+                sum_per_rc = alloc.sum(axis=1)
 
-                # compute objectives (time/distance/priority)
                 for rc_idx in range(len(self.relief_centers)):
                     for ds_idx in range(len(self.disaster_sites)):
                         allocated = alloc[rc_idx, ds_idx]
@@ -312,7 +328,6 @@ def run_moo_algorithms(relief_centres, disaster_sites, mode='Full'):
                             total_distance += self.distance_matrix[rc_idx][ds_idx] * allocated
                             priority_fulfillment += allocated * self.disaster_sites[ds_idx].get("priority_score", 0)
 
-                # unused supply penalty
                 unused_supply = float(np.sum(np.maximum(supply_vector - sum_per_rc, 0.0)))
                 penalty = ALPHA_UNUSED * unused_supply
 
@@ -320,17 +335,12 @@ def run_moo_algorithms(relief_centres, disaster_sites, mode='Full'):
                 f2[i] = total_distance + penalty
                 f3[i] = -priority_fulfillment + penalty
 
-                # Constraints: sum_per_ds <= demand_vector  -> sum_per_ds - demand <= 0
                 G[i, 0:len(self.disaster_sites)] = sum_per_ds - demand_vector
-                # Constraints: sum_per_rc <= supply_vector -> sum_per_rc - supply <= 0
                 G[i, len(self.disaster_sites):] = sum_per_rc - supply_vector
 
             out["F"] = np.column_stack([f1, f2, f3])
             out["G"] = G
 
-    # -------------------------------
-    # Unconstrained problem for MOEA/D (we'll add soft unused-supply penalty inside objectives)
-    # -------------------------------
     class UnconstrainedProblem(Problem):
         def __init__(self, relief_centers, disaster_sites, distance_matrix, time_matrix):
             self.relief_centers = relief_centers
@@ -363,12 +373,11 @@ def run_moo_algorithms(relief_centres, disaster_sites, mode='Full'):
                             total_distance += self.distance_matrix[rc_idx][ds_idx] * allocated
                             priority_fulfillment += allocated * self.disaster_sites[ds_idx].get("priority_score", 0)
 
-                # penalize allocations that exceed demand or supply (softly), and penalize unused supply
                 exceed_demand = float(np.sum(np.maximum(sum_per_ds - demand_vector, 0.0)))
                 exceed_supply = float(np.sum(np.maximum(sum_per_rc - supply_vector, 0.0)))
                 unused_supply = float(np.sum(np.maximum(supply_vector - sum_per_rc, 0.0)))
 
-                soft_penalty = 1e6 * (exceed_demand + exceed_supply)  # large penalty for hard violations
+                soft_penalty = 1e6 * (exceed_demand + exceed_supply)
                 leftover_penalty = ALPHA_UNUSED * unused_supply
 
                 f1[i] = total_time + leftover_penalty + soft_penalty
@@ -391,20 +400,16 @@ def run_moo_algorithms(relief_centres, disaster_sites, mode='Full'):
         X = res.X if hasattr(res, "X") else np.zeros((0, problem.n_var))
         pareto_size = len(F)
 
-        # Safe selection: ignore trivial all-zero solutions and any that violate hard bounds (for unconstrained)
         min_time_idx = None
         min_time_solution = None
         if F.shape[0] > 0:
-            # mask out trivial solutions (all objectives nearly zero)
             non_trivial_mask = ~np.all(np.isclose(F, 0.0, atol=1e-6), axis=1)
             if np.any(non_trivial_mask):
                 valid_idxs = np.where(non_trivial_mask)[0]
-                # among valid, choose min time
                 rel_idx = int(np.argmin(F[valid_idxs, 0]))
                 min_time_idx = int(valid_idxs[rel_idx])
                 min_time_solution = F[min_time_idx]
             else:
-                # if all trivial, keep None
                 min_time_idx = None
                 min_time_solution = None
 
@@ -412,7 +417,7 @@ def run_moo_algorithms(relief_centres, disaster_sites, mode='Full'):
         if min_time_idx is not None and X.shape[0] > 0:
             allocation = {}
             vec = X[min_time_idx]
-            alloc_mat = np.rint(vec.reshape(len(relief_centres), len(disaster_sites))).astype(int)
+            alloc_mat = np.rint(vec.reshape(len(relief_centres), len(disaster_sites))).astype(int) if False else np.rint(vec.reshape(len(relief_centres), len(disaster_sites))).astype(int)
             for rc_idx, rc in enumerate(relief_centres):
                 for ds_idx, ds in enumerate(disaster_sites):
                     allocated = int(alloc_mat[rc_idx, ds_idx])
@@ -431,7 +436,6 @@ def run_moo_algorithms(relief_centres, disaster_sites, mode='Full'):
             'X': X
         }
 
-    # NSGA-II (constrained)
     nsga_algo = NSGA2(
         pop_size=nsga_pop,
         n_offsprings=nsga_pop,
@@ -444,9 +448,7 @@ def run_moo_algorithms(relief_centres, disaster_sites, mode='Full'):
     nsga_res = _run_algorithm_on_problem(nsga_algo, problem_constrained, "NSGA-II", ('n_gen', nsga_gen))
     results['NSGA-II'] = nsga_res
 
-    # MOEA/D (unconstrained but with penalties)
     st.info("Running MOEA/D (unconstrained)")
-    # choose reference directions (tune partitions if needed)
     ref_dirs = get_reference_directions("das-dennis", n_dim=3, n_partitions=12)
     moead_algo = MOEAD(
         ref_dirs=ref_dirs,
@@ -459,7 +461,6 @@ def run_moo_algorithms(relief_centres, disaster_sites, mode='Full'):
     moead_res = _run_algorithm_on_problem(moead_algo, problem_unconstrained, "MOEAD", ('n_gen', moead_gen))
     results['MOEAD'] = moead_res
 
-    # SPEA2 (constrained)
     st.info("Running SPEA2 (constrained)")
     spea2_algo = SPEA2(
         pop_size=spea_pop,
@@ -471,7 +472,6 @@ def run_moo_algorithms(relief_centres, disaster_sites, mode='Full'):
     spea2_res = _run_algorithm_on_problem(spea2_algo, problem_constrained, "SPEA2", ('n_gen', spea_gen))
     results['SPEA2'] = spea2_res
 
-    # Build performance DataFrame (safe min fetch)
     def _safe_min_time(sol):
         return sol[0] if sol is not None else float('inf')
 
@@ -496,7 +496,6 @@ def run_moo_algorithms(relief_centres, disaster_sites, mode='Full'):
         ]
     })
 
-    # pick best (same heuristic as before)
     best_time_algo = perf.loc[perf['Min Delivery Time'].idxmin()]['Algorithm']
     best_time_value = perf['Min Delivery Time'].min()
     best_priority_algo = perf.loc[perf['Priority for Min Time'].idxmax()]['Algorithm']
@@ -528,9 +527,8 @@ def run_moo_algorithms(relief_centres, disaster_sites, mode='Full'):
     }
     return out
 
-
 # ---------------------------------------------------------------------
-# Summarize allocation to per-site (Option A: pick RC with max units)
+# Summarize allocation to per-site
 # ---------------------------------------------------------------------
 def summarize_best_allocation(moo_out, disaster_sites, relief_centres):
     if not moo_out:
@@ -649,10 +647,6 @@ def render_map(disaster_sites=None, relief_centres=None, height=600):
     return map_data
 
 def add_disaster_site(lat, lon, name, area, people_affected, severity_level, time_since_last_response, demand):
-    """
-    IMPORTANT: add 'priority' since pso_core.fitness_function expects site['priority']
-    We'll map priority = severity_level (1-10).
-    """
     ds_id = len(st.session_state.disaster_sites)
     ds = {
         "id": f"DS{ds_id}",
@@ -664,7 +658,6 @@ def add_disaster_site(lat, lon, name, area, people_affected, severity_level, tim
         "severity_level": severity_level,
         "time_since_last_response": time_since_last_response,
         "demand": demand,
-        # critical field for PSO fitness
         "priority": severity_level
     }
     st.session_state.disaster_sites.append(ds)
@@ -677,7 +670,7 @@ def add_relief_centre(lat, lon, supply=1000):
         "name": f"Manual RC {rc_id+1}",
         "lat": lat,
         "lon": lon,
-        "supply": None,
+        "supply": int(supply) if supply is not None else 0,
         "area": "User Added",
         "source": "Manual"
     }
@@ -688,7 +681,7 @@ def delete_relief_centre(rc_id):
     st.session_state.relief_centres = [rc for rc in st.session_state.relief_centres if rc['id'] != rc_id]
 
 # ---------------------------------------------------------------------
-# Sidebar & forms
+# Sidebar & UI
 # ---------------------------------------------------------------------
 def render_disaster_site_form():
     st.sidebar.markdown("### 📍 Disaster Site Details")
@@ -716,9 +709,10 @@ def render_sidebar():
     steps = {
         'setup': '1️⃣ Setup',
         'marking': '2️⃣ Mark Sites',
-        'pso_run': '3️⃣ PSO Optimization',
-        'editing': '4️⃣ Edit Relief Centres',
-        'nsga_run': '5️⃣ Multi-Algorithm Allocation',
+        'supply_input': '3️⃣ Enter Supplies',
+        'pso_run': '4️⃣ PSO Optimization',
+        'editing': '5️⃣ Edit Relief Centres',
+        'nsga_run': '6️⃣ Multi-Algorithm Allocation',
         'results': '✅ Results'
     }
     current = st.session_state.current_step
@@ -727,7 +721,7 @@ def render_sidebar():
     if current == 'setup':
         st.sidebar.markdown("### 🎯 Setup")
         num_sites = st.sidebar.number_input("How many disaster sites?", min_value=1, max_value=20, value=3, key="num_sites_input")
-        num_rc = st.sidebar.number_input("How many relief centres (for PSO)?", min_value=1, max_value=20, value=5, key="num_rc_input")
+        num_rc = st.sidebar.number_input("How many relief centres (for PSO)?", min_value=1, max_value=20, value=3, key="num_rc_input")
         moo_mode = st.sidebar.selectbox("MOO Mode:", ["Full", "Quick"], key="moo_mode_select")
         if st.sidebar.button("🚀 Start Marking Sites"):
             st.session_state.num_disaster_sites = int(num_sites)
@@ -735,6 +729,7 @@ def render_sidebar():
             st.session_state.current_step = 'marking'
             st.session_state.moo_mode = moo_mode
             st.rerun()
+
     elif current == 'marking':
         st.sidebar.markdown("### 📍 Mark Disaster Sites")
         st.sidebar.markdown(f"**Progress:** {len(st.session_state.disaster_sites)}/{st.session_state.num_disaster_sites}")
@@ -743,21 +738,43 @@ def render_sidebar():
         else:
             st.sidebar.info("Double-click on the map to select coordinates for a disaster site.")
         if len(st.session_state.disaster_sites) >= st.session_state.num_disaster_sites:
-            if st.sidebar.button("▶️ Run PSO Algorithm"):
-                st.session_state.current_step = 'pso_run'
+            if st.sidebar.button("▶️ Enter Supplies for Relief Centres"):
+                # prepare supply inputs list
+                st.session_state.supply_inputs = [1000] * st.session_state.num_relief_centres
+                st.session_state.current_step = 'supply_input'
                 st.rerun()
+
+    elif current == 'supply_input':
+        st.sidebar.markdown("### 📦 Enter supply for each Relief Centre (used by PSO)")
+        # show inputs for each prospective RC
+        n_rc = st.session_state.num_relief_centres
+        temp = []
+        for i in range(n_rc):
+            key = f"supply_input_{i}"
+            default_val = st.session_state.supply_inputs[i] if i < len(st.session_state.supply_inputs) else 1000
+            v = st.sidebar.number_input(f"Supply for RC {i+1}", min_value=0, max_value=100000, value=int(default_val), key=key)
+            temp.append(int(v))
+        st.session_state.supply_inputs = temp
+        st.sidebar.markdown("---")
+        if st.sidebar.button("▶️ Run PSO Algorithm with these supplies"):
+            st.session_state.current_step = 'pso_run'
+            st.rerun()
+        if st.sidebar.button("← Back to Marking"):
+            st.session_state.current_step = 'marking'
+            st.rerun()
+
     elif current == 'pso_run':
         st.sidebar.markdown("### 🔄 PSO Running...")
-        st.sidebar.info("PSO proposes relief centre locations. After completion you can edit them.")
-    elif current == 'editing':
-        st.markdown("### 📦 Enter Supply for Each Relief Centre")
+        st.sidebar.info("PSO proposes relief centre locations using the supplies you entered. After completion you can edit them.")
 
+    elif current == 'editing':
+        st.markdown("### ✏️ Edit Relief Centres & Supplies")
         for rc in st.session_state.relief_centres:
             default_supply = rc.get("supply") or 0
             rc["supply"] = st.number_input(
                 f"Supply for {rc['name']} ({rc['area']})",
                 min_value=0,
-                max_value=10000,
+                max_value=100000,
                 value=default_supply,
                 key=f"supply_{rc['id']}"
             )
@@ -776,7 +793,7 @@ def render_sidebar():
             if edit_option == "Add Relief Centre":
                 st.sidebar.info("Double-click the map to place a manual relief centre.")
                 if st.session_state.last_click:
-                    supply = st.sidebar.number_input("Supply (units)", min_value=1, max_value=10000, value=1000)
+                    supply = st.sidebar.number_input("Supply (units)", min_value=1, max_value=100000, value=1000)
                     if st.sidebar.button("➕ Add Relief Centre"):
                         add_relief_centre(st.session_state.last_click['lat'], st.session_state.last_click['lng'], supply)
                         st.session_state.last_click = None
@@ -793,6 +810,7 @@ def render_sidebar():
                         st.rerun()
                 else:
                     st.sidebar.warning("No relief centres to delete.")
+
     elif current == 'nsga_run':
         st.sidebar.markdown("### 🔄 Allocation Running")
         st.sidebar.info("Running NSGA-II, MOEA/D (unconstrained), SPEA2. This can take minutes.")
@@ -803,7 +821,7 @@ def render_sidebar():
         st.rerun()
 
 # ---------------------------------------------------------------------
-# Display helpers
+# Display helpers (unchanged)
 # ---------------------------------------------------------------------
 def display_results():
     c1, c2 = st.columns(2)
@@ -883,7 +901,6 @@ def display_moo_summary(moo_out):
     pie_fig = px.pie(values=[summary['total_delivered'], summary['total_shortage']], names=['Fulfilled', 'Shortage'], title='Overall Fulfillment', color_discrete_sequence=['green', 'red'])
     st.plotly_chart(pie_fig, use_container_width=True)
 
-    # CSV download
     csv = summary['df'].to_csv(index=False)
     st.download_button("⬇️ Download per-site summary (CSV)", data=csv, file_name="per_site_summary.csv", mime="text/csv")
 
@@ -909,11 +926,16 @@ def main():
             st.session_state.last_click = map_data['last_clicked']
             st.rerun()
         display_results()
+    elif st.session_state.current_step == 'supply_input':
+        st.info("Enter supply for each prospective relief centre in the sidebar, then run PSO.")
+        render_map(disaster_sites=st.session_state.disaster_sites)
+        display_results()
     elif st.session_state.current_step == 'pso_run':
         st.markdown("### 🔄 Running PSO Algorithm...")
         with st.spinner("Running PSO..."):
             num_rc = st.session_state.num_relief_centres if st.session_state.num_relief_centres else min(5, len(st.session_state.disaster_sites))
-            relief_centres = run_pso_algorithm(st.session_state.disaster_sites, num_relief_centers=num_rc)
+            supply_vector = st.session_state.supply_inputs if st.session_state.supply_inputs else [1000] * num_rc
+            relief_centres = run_pso_algorithm(st.session_state.disaster_sites, num_relief_centers=num_rc, supply_vector=supply_vector)
             st.session_state.relief_centres = relief_centres
             st.session_state.pso_completed = True
             st.session_state.current_step = 'editing'

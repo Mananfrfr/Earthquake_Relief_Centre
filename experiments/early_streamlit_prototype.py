@@ -8,7 +8,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 # Import your algorithms
-from pso_core import fitness_function, disaster_sites as default_disaster_sites, haversine_km
+from relief_optimization.pso import fitness_function, disaster_sites as default_disaster_sites, haversine_km
 import random
 
 # ============================================================================
@@ -228,7 +228,7 @@ def run_nsga_algorithm(disaster_sites, relief_centres):
         distance_matrix.append(distances)
 
     # Simple greedy allocation (simplified version)
-    # In production, this would use the full NSGA-II from new.py
+    # In production, this would use the full NSGA-II from experiments/multi_objective_allocation.py
     allocation_results = []
 
     for ds_idx, ds in enumerate(disaster_sites):

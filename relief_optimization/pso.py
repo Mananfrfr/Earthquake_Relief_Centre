@@ -1,4 +1,4 @@
-# pso_core.py
+# relief_optimization/pso.py
 # PSO fitness & helpers for Earthquake Relief app
 # - Supports per-RC supply vector
 # - Computes dynamic bounding box from disaster sites and applies strong soft penalties

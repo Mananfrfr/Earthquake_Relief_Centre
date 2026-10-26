@@ -1,0 +1,6 @@
+-r requirements.txt
+matplotlib
+geopy
+networkx
+osmnx
+openrouteservice

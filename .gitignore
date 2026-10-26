@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+data/
+*.graphml
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

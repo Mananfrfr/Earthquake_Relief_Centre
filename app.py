@@ -17,7 +17,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 # Import PSO fitness & helpers
-from pso_core import fitness_function, haversine_km, get_bounds_from_sites
+from relief_optimization.pso import fitness_function, haversine_km, get_bounds_from_sites
 
 # ---------------------------------------------------------------------
 # CONFIG
@@ -704,7 +704,7 @@ def render_disaster_site_form():
 def render_sidebar():
     st.sidebar.title("🚨 Disaster Relief System")
     st.sidebar.markdown("---")
-    st.sidebar.markdown("**Algorithm/Pipeline note:** PSO logic from `/mnt/data/pso_core.py`")
+    st.sidebar.markdown("**Algorithm/Pipeline note:** PSO logic from `relief_optimization/pso.py`")
     st.sidebar.markdown("---")
     steps = {
         'setup': '1️⃣ Setup',
@@ -914,7 +914,7 @@ def main():
 
     st.title("🚨 Earthquake Disaster Site & Relief Centre Optimization (PSO + MOO)")
     st.markdown("---")
-    st.markdown("**Algorithm file path (uploaded):** `/mnt/data/pso_core.py`")
+    st.markdown("**PSO optimization module:** `relief_optimization/pso.py`")
 
     if st.session_state.current_step == 'setup':
         st.info("Set # disaster sites and # relief centres in the sidebar to begin")

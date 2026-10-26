@@ -10,6 +10,7 @@
 # Import necessary libraries
 import networkx as nx
 import random
+import os
 import numpy as np
 import osmnx as ox
 import openrouteservice
@@ -86,14 +87,14 @@ for ds in disaster_sites:
 def haversine(lat1, lon1, lat2, lon2):
     R = 6371  # Radius of Earth in kilometers
     dlat = radians(lat2 - lat1)
-    dlon = radians(lat2 - lon1)
+    dlon = radians(lon2 - lon1)
     a = sin(dlat / 2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2)**2
     c = 2 * atan2(sqrt(a), sqrt(1 - a))
     return R * c
 
 # Initialize OpenRouteService client
-ORS_API_KEY = ""  # Replace with your OpenRouteService API key : 5b3ce3597851110001cf62487c4f201b3ce640f684117feac321399b
-client = openrouteservice.Client(key=ORS_API_KEY)
+ORS_API_KEY = os.environ.get("OPENROUTESERVICE_API_KEY", "").strip()
+client = openrouteservice.Client(key=ORS_API_KEY) if ORS_API_KEY else None
 
 # Create a graph using osmnx
 graph = ox.graph_from_point((26.9124, 75.7873), dist=5000, network_type='drive')  # 5 km radius
